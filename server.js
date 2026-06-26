@@ -193,6 +193,15 @@ function handle(ws, msg) {
       break;
     }
 
+    case 'chat': {
+      const room = ws.room; if (!room) return needRoom(ws);
+      const text = typeof msg.text === 'string' ? msg.text.slice(0, 500).trim() : '';
+      if (!text) return;
+      const from = typeof msg.from === 'string' ? msg.from.slice(0, 40) : 'peer';
+      broadcast(room, { type: 'chat', text, from, t: Date.now() }, ws);
+      break;
+    }
+
     case 'requestSync': {
       // Used by Relaxed mode's "Re-sync" button: catch the asker up to current state.
       const room = ws.room; if (!room) return needRoom(ws);
