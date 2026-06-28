@@ -54,6 +54,10 @@ function needRoom(ws) {
   send(ws, { type: 'error', code: 'no_room', message: 'Join a room first.' });
 }
 
+function cleanName(n) {
+  return (typeof n === 'string' && n.trim()) ? n.trim().slice(0, 40) : 'Guest';
+}
+
 // If auto-pause is on and anyone is unstable, force everyone to pause.
 function evaluateStability(room) {
   const blocked = room.autoPause && room.unstable.size > 0;
@@ -69,13 +73,22 @@ function evaluateStability(room) {
 function leaveRoom(ws) {
   const room = ws.room;
   if (!room) return;
+  const wasHost = room.hostWs === ws;
+  const leaverName = ws.name || 'Guest';
   room.clients.delete(ws);
   room.unstable.delete(ws);
   ws.room = null;
 
   if (room.clients.size === 0) { rooms.delete(room.code); return; }
 
-  broadcast(room, { type: 'peerLeft', peers: room.clients.size });
+  // If the host left, hand the room to whoever remains.
+  if (wasHost) {
+    room.hostWs = room.clients.values().next().value || null;
+    if (room.hostWs) send(room.hostWs, { type: 'control', control: room.control, youAreHost: true });
+    broadcast(room, { type: 'control', control: room.control }, room.hostWs);
+  }
+
+  broadcast(room, { type: 'peerLeft', peers: room.clients.size, name: leaverName });
 
   // A disconnect counts as a connection problem: pause the rest if enabled.
   if (room.autoPause && room.state.playing) {
@@ -91,6 +104,7 @@ function handle(ws, msg) {
   switch (msg.type) {
     case 'create': {
       if (ws.room) leaveRoom(ws);
+      ws.name = cleanName(msg.name);
       const code = makeRoomCode();
       const room = {
         code,
@@ -98,11 +112,13 @@ function handle(ws, msg) {
         state: { videoUrl: msg.url || null, playing: false, time: 0, updatedAt: Date.now() },
         autoPause: msg.autoPause !== undefined ? !!msg.autoPause : true, // strict vs relaxed
         roomName: typeof msg.roomName === 'string' ? msg.roomName.slice(0, 60) : null,
+        control: msg.control === 'host' ? 'host' : 'all', // who may play/pause/seek
+        hostWs: ws,
         unstable: new Set(),
       };
       rooms.set(code, room);
       ws.room = room;
-      send(ws, { type: 'created', room: code, roomName: room.roomName, autoPause: room.autoPause });
+      send(ws, { type: 'created', room: code, roomName: room.roomName, autoPause: room.autoPause, control: room.control, isHost: true });
       break;
     }
 
@@ -113,6 +129,8 @@ function handle(ws, msg) {
       if (room.clients.size >= MAX_CLIENTS_PER_ROOM)
         return send(ws, { type: 'error', code: 'room_full', message: 'Room is full.' });
       if (ws.room) leaveRoom(ws);
+      ws.name = cleanName(msg.name);
+      const otherNames = [...room.clients].map((c) => c.name || 'Guest');
       room.clients.add(ws);
       ws.room = room;
       // Snapshot the newcomer onto the current state.
@@ -122,11 +140,15 @@ function handle(ws, msg) {
         roomName: room.roomName,
         peers: room.clients.size,
         autoPause: room.autoPause,
+        control: room.control,
+        isHost: ws === room.hostWs,
+        hostName: (room.hostWs && room.hostWs.name) || null,
+        names: otherNames,
         video: room.state.videoUrl,
         playing: room.state.playing,
         time: currentTime(room),
       });
-      broadcast(room, { type: 'peerJoined', peers: room.clients.size }, ws);
+      broadcast(room, { type: 'peerJoined', peers: room.clients.size, name: ws.name }, ws);
       break;
     }
 
@@ -142,6 +164,9 @@ function handle(ws, msg) {
 
     case 'play': {
       const room = ws.room; if (!room) return needRoom(ws);
+      if (room.control === 'host' && ws !== room.hostWs) {
+        return send(ws, { type: 'denied', action: 'play', message: 'Host controls playback in this room.' });
+      }
       if (evaluateStability(room)) {
         return send(ws, { type: 'forcePause', reason: 'network_unstable', time: currentTime(room) });
       }
@@ -154,6 +179,9 @@ function handle(ws, msg) {
 
     case 'pause': {
       const room = ws.room; if (!room) return needRoom(ws);
+      if (room.control === 'host' && ws !== room.hostWs) {
+        return send(ws, { type: 'denied', action: 'pause', message: 'Host controls playback in this room.' });
+      }
       room.state.playing = false;
       room.state.time = typeof msg.time === 'number' ? msg.time : currentTime(room);
       room.state.updatedAt = Date.now();
@@ -163,9 +191,21 @@ function handle(ws, msg) {
 
     case 'seek': {
       const room = ws.room; if (!room) return needRoom(ws);
+      if (room.control === 'host' && ws !== room.hostWs) {
+        return send(ws, { type: 'denied', action: 'seek', message: 'Host controls playback in this room.' });
+      }
       room.state.time = typeof msg.time === 'number' ? msg.time : 0;
       room.state.updatedAt = Date.now();
       broadcast(room, { type: 'seek', time: room.state.time }, ws);
+      break;
+    }
+
+    case 'setControl': {
+      const room = ws.room; if (!room) return needRoom(ws);
+      if (ws !== room.hostWs) return send(ws, { type: 'denied', action: 'setControl', message: 'Only the host can change this.' });
+      room.control = msg.control === 'host' ? 'host' : 'all';
+      broadcast(room, { type: 'control', control: room.control }, ws);
+      send(ws, { type: 'control', control: room.control, youAreHost: true });
       break;
     }
 
