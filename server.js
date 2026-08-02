@@ -8,6 +8,10 @@
  * server only passes around three things — play, pause, seek — plus
  * a couple of room/housekeeping messages.
  *
+ * Also keeps a per-room "up next" queue: anyone can add links (unless
+ * the host locks it), and when a video ends the room auto-advances to
+ * the next link in the queue.
+ *
  * Run:  node server.js     (listens on ws://0.0.0.0:8080 by default)
  */
 
@@ -21,6 +25,7 @@ const RATE_LIMIT_MAX = 25;          // max inbound messages...
 const RATE_LIMIT_WINDOW_MS = 2000;  // ...per this rolling window (per client)
 const ROOM_CODE_LENGTH = 6;
 const MAX_CLIENTS_PER_ROOM = 8;     // it's for friends, not a broadcast
+const MAX_QUEUE_ITEMS = 50;
 
 const rooms = new Map(); // code -> Room
 
@@ -70,6 +75,21 @@ function evaluateStability(room) {
   return blocked;
 }
 
+// Pop the next queued link and make it the room's current video.
+// Broadcast to EVERYONE (including whoever triggered it) so all clients
+// converge through the same 'video' message.
+function advanceQueue(room) {
+  if (!room.queue || room.queue.length === 0) return false;
+  const next = room.queue.shift();
+  room.state.videoUrl = next.url;
+  room.state.time = 0;
+  room.state.playing = false;
+  room.state.updatedAt = Date.now();
+  broadcast(room, { type: 'video', url: next.url, autoAdvanced: true, addedBy: next.addedBy });
+  broadcast(room, { type: 'queue', queue: room.queue, locked: room.queueLocked });
+  return true;
+}
+
 function leaveRoom(ws) {
   const room = ws.room;
   if (!room) return;
@@ -115,6 +135,9 @@ function handle(ws, msg) {
         control: msg.control === 'host' ? 'host' : 'all', // who may play/pause/seek
         hostWs: ws,
         unstable: new Set(),
+        queue: [],           // [{ id, url, addedBy }]
+        queueLocked: false,  // when true, only the host can add links
+        queueSeq: 0,
       };
       rooms.set(code, room);
       ws.room = room;
@@ -147,6 +170,8 @@ function handle(ws, msg) {
         video: room.state.videoUrl,
         playing: room.state.playing,
         time: currentTime(room),
+        queue: room.queue,
+        queueLocked: room.queueLocked,
       });
       broadcast(room, { type: 'peerJoined', peers: room.clients.size, name: ws.name }, ws);
       break;
@@ -250,7 +275,71 @@ function handle(ws, msg) {
         video: room.state.videoUrl,
         playing: room.state.playing,
         time: currentTime(room),
+        queue: room.queue,
+        queueLocked: room.queueLocked,
       });
+      break;
+    }
+
+    // ---- up-next queue ----------------------------------------
+    case 'queueAdd': {
+      const room = ws.room; if (!room) return needRoom(ws);
+      if (room.queueLocked && ws !== room.hostWs) {
+        return send(ws, { type: 'denied', action: 'queueAdd', message: 'The host has locked the queue.' });
+      }
+      const url = typeof msg.url === 'string' ? msg.url.trim().slice(0, 2000) : '';
+      if (!/^https?:\/\//i.test(url)) {
+        return send(ws, { type: 'error', code: 'bad_url', message: 'Queue links must start with http(s)://' });
+      }
+      if (room.queue.length >= MAX_QUEUE_ITEMS) {
+        return send(ws, { type: 'error', code: 'queue_full', message: `The queue is full (${MAX_QUEUE_ITEMS} max).` });
+      }
+      room.queueSeq += 1;
+      room.queue.push({ id: room.queueSeq, url, addedBy: ws.name || 'Guest' });
+      broadcast(room, { type: 'queue', queue: room.queue, locked: room.queueLocked });
+      break;
+    }
+
+    case 'queueRemove': {
+      const room = ws.room; if (!room) return needRoom(ws);
+      const idx = room.queue.findIndex((q) => q.id === msg.id);
+      if (idx === -1) return;
+      if (ws !== room.hostWs && room.queue[idx].addedBy !== (ws.name || 'Guest')) {
+        return send(ws, { type: 'denied', action: 'queueRemove', message: 'You can only remove links you added.' });
+      }
+      room.queue.splice(idx, 1);
+      broadcast(room, { type: 'queue', queue: room.queue, locked: room.queueLocked });
+      break;
+    }
+
+    case 'queueLock': {
+      const room = ws.room; if (!room) return needRoom(ws);
+      if (ws !== room.hostWs) {
+        return send(ws, { type: 'denied', action: 'queueLock', message: 'Only the host can lock the queue.' });
+      }
+      room.queueLocked = !!msg.locked;
+      broadcast(room, { type: 'queueLock', locked: room.queueLocked });
+      break;
+    }
+
+    case 'queueNext': {
+      // Manual skip to the next queued link (respects playback control mode).
+      const room = ws.room; if (!room) return needRoom(ws);
+      if (room.control === 'host' && ws !== room.hostWs) {
+        return send(ws, { type: 'denied', action: 'queueNext', message: 'Host controls playback in this room.' });
+      }
+      advanceQueue(room);
+      break;
+    }
+
+    case 'ended': {
+      // A client's video finished. Advance exactly once: only when the URL the
+      // client reports matches the room's current video. When two viewers both
+      // report the same ending, the first advances the queue (which changes the
+      // current URL) and the second report no longer matches, so it's ignored.
+      const room = ws.room; if (!room) return needRoom(ws);
+      if (typeof msg.url !== 'string' || msg.url !== room.state.videoUrl) return;
+      advanceQueue(room);
       break;
     }
 
